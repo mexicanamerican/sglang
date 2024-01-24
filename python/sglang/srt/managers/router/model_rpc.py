@@ -203,6 +203,7 @@ class ModelRpcServer(rpyc.Service):
         req = Req(recv_req.rid)
         req.input_ids = recv_req.input_ids
         req.pixel_values = recv_req.pixel_values
+        req.image_size = recv_req.image_size
         if req.pixel_values is not None:
             pad_value = [
                 (recv_req.image_hash) % self.model_config.vocab_size,
@@ -211,7 +212,7 @@ class ModelRpcServer(rpyc.Service):
                 (recv_req.image_hash >> 64) % self.model_config.vocab_size,
             ]
             req.input_ids, req.image_offset = self.model_runner.model.pad_input_ids(
-                req.input_ids, pad_value
+                req.input_ids, pad_value, req.pixel_values.shape, req.image_size
             )
         req.sampling_params = recv_req.sampling_params
         req.return_logprob = recv_req.return_logprob
@@ -228,6 +229,7 @@ class ModelRpcServer(rpyc.Service):
         req.sampling_params.max_new_tokens = min(
             req.sampling_params.max_new_tokens,
             self.model_config.context_len - 1 - len(req.input_ids),
+            self.max_total_num_token - 128 - len(req.input_ids),
         )
         self.forward_queue.append(req)
 

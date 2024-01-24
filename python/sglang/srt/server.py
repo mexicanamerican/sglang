@@ -380,12 +380,13 @@ def launch_server(server_args, pipe_finish_writer):
 
         success = False
         for i in range(60):
+            time.sleep(1)
             try:
                 res = requests.get(url + "/get_model_info", timeout=5)
                 success = True
                 break
             except requests.exceptions.RequestException as e:
-                time.sleep(1)
+                pass
 
         if success:
             pipe_finish_writer.send("init ok")
@@ -406,7 +407,7 @@ class Runtime:
         model_mode: List[str] = (),
         schedule_heuristic: str = "lpm",
         random_seed: int = 42,
-        log_level: str = "warning",
+        log_level: str = "error",
     ):
         host = "127.0.0.1"
         port = alloc_usable_network_port(1)[0]
@@ -425,8 +426,6 @@ class Runtime:
             random_seed=random_seed,
             log_level=log_level,
         )
-        import torch
-        torch.multiprocessing.set_start_method("spawn", force=True)
 
         self.url = self.server_args.url()
         self.generate_url = (
@@ -469,7 +468,6 @@ class Runtime:
         prompt: str,
         sampling_params,
     ) -> None:
-
         json_data = {
             "text": prompt,
             "sampling_params": sampling_params,
