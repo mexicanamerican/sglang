@@ -13,11 +13,13 @@ setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
 
 import aiohttp
 import psutil
+import pydantic
 import requests
 import uvicorn
 import uvloop
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
 from sglang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.srt.conversation import (
     Conversation,
@@ -28,7 +30,7 @@ from sglang.srt.conversation import (
 )
 from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.managers.detokenizer_manager import start_detokenizer_process
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import DetokenizeReqInput, GenerateReqInput
 from sglang.srt.managers.openai_protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -42,6 +44,7 @@ from sglang.srt.managers.openai_protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     DeltaMessage,
+    LogProbs,
     UsageInfo,
 )
 from sglang.srt.managers.router.manager import start_router_process
@@ -55,6 +58,16 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 app = FastAPI()
 tokenizer_manager = None
 chat_template_name = None
+
+
+# FIXME: Remove this once we drop support for pydantic 1.x
+IS_PYDANTIC_1 = int(pydantic.VERSION.split(".")[0]) == 1
+
+
+def jsonify_pydantic_model(obj: BaseModel):
+    if IS_PYDANTIC_1:
+        return obj.json(ensure_ascii=False)
+    return obj.model_dump_json()
 
 
 @app.get("/health")
@@ -75,7 +88,8 @@ async def get_model_info():
 async def flush_cache():
     await tokenizer_manager.flush_cache()
     return Response(
-        content="Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n",
+        content="Cache flushed.\nPlease check backend logs for more details. "
+        "(When there are running or waiting requests, the operation will not be performed.)\n",
         status_code=200,
     )
 
@@ -83,6 +97,23 @@ async def flush_cache():
 async def stream_generator(obj):
     async for out in tokenizer_manager.generate_request(obj):
         yield out
+
+
+async def make_openai_style_logprobs(token_logprobs):
+    ret_logprobs = LogProbs()
+
+    # Detokenize
+    token_ids = [tid for tid, _ in token_logprobs]
+    token_texts = await tokenizer_manager.detokenize(DetokenizeReqInput(token_ids))
+
+    for token_text, (_, token_logprob) in zip(token_texts, token_logprobs):
+        ret_logprobs.tokens.append(token_text)
+        ret_logprobs.token_logprobs.append(token_logprob)
+
+        # Not supported yet.
+        ret_logprobs.top_logprobs.append({})
+        ret_logprobs.text_offset.append(-1)
+    return ret_logprobs
 
 
 @app.post("/generate")
@@ -120,6 +151,7 @@ async def v1_completions(raw_request: Request):
             "presence_penalty": request.presence_penalty,
             "frequency_penalty": request.frequency_penalty,
         },
+        return_logprob=request.logprobs is not None,
         stream=request.stream,
     )
     adapted_request.post_init()
@@ -128,17 +160,34 @@ async def v1_completions(raw_request: Request):
 
         async def gnerate_stream_resp():
             stream_buffer = ""
+            n_prev_token = 0
             async for content in stream_generator(adapted_request):
                 text = content["text"]
                 prompt_tokens = content["meta_info"]["prompt_tokens"]
                 completion_tokens = content["meta_info"]["completion_tokens"]
 
+                if not stream_buffer:  # The first chunk
+                    if request.echo:
+                        # Prepend prompt in response text.
+                        text = request.prompt + text
+                    else:
+                        # Skip prompt tokens if echo is disabled.
+                        n_prev_token = prompt_tokens
+
+                if request.logprobs is not None:
+                    logprobs = await make_openai_style_logprobs(
+                        content["meta_info"]["token_logprob"][n_prev_token:]
+                    )
+                    n_prev_token = len(content["meta_info"]["token_logprob"])
+                else:
+                    logprobs = None
+
                 delta = text[len(stream_buffer) :]
-                stream_buffer = text
+                stream_buffer = content["text"]
                 choice_data = CompletionResponseStreamChoice(
                     index=0,
                     text=delta,
-                    logprobs=None,
+                    logprobs=logprobs,
                     finish_reason=None,
                 )
                 chunk = CompletionStreamResponse(
@@ -152,7 +201,7 @@ async def v1_completions(raw_request: Request):
                         total_tokens=prompt_tokens + completion_tokens,
                     ),
                 )
-                yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
+                yield f"data: {jsonify_pydantic_model(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")
@@ -160,15 +209,30 @@ async def v1_completions(raw_request: Request):
     # Non-streaming response.
     ret = await generate_request(adapted_request)
 
+    prompt_tokens = ret["meta_info"]["prompt_tokens"]
+    completion_tokens = ret["meta_info"]["completion_tokens"]
+    text = ret["text"]
+    token_logprob_pos = prompt_tokens
+    if request.echo:
+        token_logprob_pos = 0
+        text = request.prompt + text
+    else:
+        token_logprob_pos = prompt_tokens
+
+    logprobs = (
+        await make_openai_style_logprobs(
+            ret["meta_info"]["token_logprob"][token_logprob_pos:]
+        )
+        if request.logprobs is not None
+        else None
+    )
     choice_data = CompletionResponseChoice(
         index=0,
-        text=ret["text"],
-        logprobs=None,
+        text=text,
+        logprobs=logprobs,
         finish_reason=None,  # TODO(comaniac): Add finish reason.
     )
 
-    prompt_tokens = ret["meta_info"]["prompt_tokens"]
-    completion_tokens = ret["meta_info"]["completion_tokens"]
     response = CompletionResponse(
         id=ret["meta_info"]["id"],
         model=request.model,
@@ -204,7 +268,9 @@ async def v1_chat_completions(raw_request: Request):
                 if not isinstance(m.content, str):
                     raise HTTPException(
                         status_code=503,
-                        detail="Structured content requests not supported with HuggingFace Chat Templates.  Make sure the server specifies a sglang chat template.",
+                        detail="Structured content requests not supported with "
+                        "HuggingFace Chat Templates. "
+                        "Make sure the server specifies a sglang chat template.",
                     )
             prompt = tokenizer_manager.tokenizer.apply_chat_template(
                 request.messages, tokenize=False, add_generation_prompt=True
@@ -262,7 +328,7 @@ async def v1_chat_completions(raw_request: Request):
                         choices=[choice_data],
                         model=request.model,
                     )
-                    yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
+                    yield f"data: {jsonify_pydantic_model(chunk)}\n\n"
 
                 text = content["text"]
                 delta = text[len(stream_buffer) :]
@@ -275,7 +341,7 @@ async def v1_chat_completions(raw_request: Request):
                     choices=[choice_data],
                     model=request.model,
                 )
-                yield f"data: {chunk.json(exclude_unset=True, ensure_ascii=False)}\n\n"
+                yield f"data: {jsonify_pydantic_model(chunk)}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(gnerate_stream_resp(), media_type="text/event-stream")
