@@ -201,6 +201,18 @@ def get_available_gpu_memory(device, gpu_id, distributed=False):
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
 
+    elif device == "hpu":
+        num_gpus = torch.hpu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.hpu.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
+                "which may cause useless memory allocation for torch HPU context.",
+            )
+
+        free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
+
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
             torch.device(device, gpu_id)
@@ -430,16 +442,12 @@ def suppress_other_loggers():
     from vllm.logger import logger as vllm_default_logger
 
     vllm_default_logger.setLevel(logging.WARN)
-    logging.getLogger("vllm.config").setLevel(logging.ERROR)
     logging.getLogger("vllm.distributed.device_communicators.pynccl").setLevel(
         logging.WARN
     )
     logging.getLogger("vllm.distributed.device_communicators.shm_broadcast").setLevel(
         logging.WARN
     )
-    logging.getLogger("vllm.selector").setLevel(logging.WARN)
-    logging.getLogger("vllm.utils").setLevel(logging.ERROR)
-    logging.getLogger("vllm.model_executor.model_loader.loader").setLevel(logging.ERROR)
 
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
@@ -490,27 +498,6 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
-
-
-def monkey_patch_vllm_model_config():
-    from vllm.config import ModelConfig
-
-    if not hasattr(ModelConfig, "_resolve_task"):
-        return
-
-    def _resolve_task(
-        self,
-        task_option,
-        hf_config,
-    ):
-        supported_tasks = {
-            "generate": True,
-            "embedding": False,
-        }
-        selected_task = "generate"
-        return supported_tasks, selected_task
-
-    setattr(ModelConfig, "_resolve_task", _resolve_task)
 
 
 def monkey_patch_vllm_p2p_access_check(gpu_id: int):
@@ -904,7 +891,7 @@ def get_amdgpu_memory_capacity():
         # Run rocm-smi and capture the output
         result = subprocess.run(
             [
-                "rocminfo | grep 'gfx94' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
+                "rocminfo | grep 'gfx' -A 100 | grep 'Pool 1' -A 5 | grep 'Size:' | awk '{print $2}'"
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -961,6 +948,37 @@ def get_nvgpu_memory_capacity():
     except FileNotFoundError:
         raise RuntimeError(
             "nvidia-smi not found. Ensure NVIDIA drivers are installed and accessible."
+        )
+
+
+def get_hpu_memory_capacity():
+    try:
+        # Run hl-smi and capture the output
+        result = subprocess.run(
+            ["hl-smi --query | grep 'Total'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"hl-smi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values in MiB
+        memory_values = [
+            float(mem.split(" ")[-2]) for mem in result.stdout.strip().split("\n")
+        ]
+
+        if not memory_values:
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "hl-smi not found. Ensure Habana drivers are installed and accessible."
         )
 
 
@@ -1041,6 +1059,11 @@ def crash_on_warnings():
     return get_bool_env_var("SGLANG_IS_IN_CI")
 
 
+def print_warning_once(msg: str) -> None:
+    # Set the stacklevel to 2 to print the caller's line info
+    logger.warning(msg, stacklevel=2)
+
+
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         return torch.cuda.get_device_name(device_id)
@@ -1053,6 +1076,40 @@ def get_device_name(device_id: int = 0) -> str:
 
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return torch.hpu.get_device_name(device_id)
+
+
+def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
+    major, minor = None, None
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(device_id)
+
+    if hasattr(torch, "hip") and torch.hip.is_available():
+        major, minor = torch.cuda.get_device_capability(device_id)
+
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        major, minor, *_ = torch.xpu.get_device_capability(device_id)["version"].split(
+            "."
+        )
+        major, minor = int(major), int(minor)
+
+    # TODO(HandH1998): `get_device_capability` is not supported by `torch.hpu` for now.
+    # Update this once the support is available.
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        try:
+            major, minor = torch.hpu.get_device_capability(device_id)
+        except Exception as e:
+            raise RuntimeError(
+                f"An error occurred while getting device capability of hpu: {e}."
+            ) from e
+
+    return major, minor
+
+
+def get_compiler_backend() -> str:
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return "hpu_backend"
+
+    return "inductor"
 
 
 sglang_lib = Library("sglang", "FRAGMENT")  # noqa
