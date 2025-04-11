@@ -236,7 +236,11 @@ def make_local_attention_virtual_batches(
         np.arange(pages_per_local_batch, dtype=np.int32),
         (virtual_batches, pages_per_local_batch),
     ) + np.expand_dims(block_starts, axis=1)
-    block_indices = block_indices.flatten()
+    # Ensure block_indices doesn't exceed block_table dimensions
+    # This is a critical safety check that prevents index out of bounds errors
+    # when dealing with large sequences (>8192 tokens) or when the block_table
+    # dimensions are smaller than what would be needed for the full attention chunk size.
+    block_indices = block_indices.flatten().clip(max=block_table.shape[1] - 1)
     batch_indices = np.repeat(
         np.arange(actual_batch_size, dtype=np.int32),
         local_blocks * pages_per_local_batch,
@@ -973,10 +977,12 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
                 page_indices = self.req_to_token[
-                    :,
-                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
+                    req_pool_indices[:, None],
+                    self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
+                        None, :
+                    ],
                 ]
-                page_indices = page_indices[req_pool_indices] // self.page_size
+                page_indices //= self.page_size
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
                 metadata.page_table[:, max_seq_pages:].fill_(0)
 
