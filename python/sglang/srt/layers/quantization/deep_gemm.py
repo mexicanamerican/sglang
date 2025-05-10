@@ -28,6 +28,11 @@ if is_cuda():
         if get_bool_env_var("SGL_ENABLE_JIT_DEEPGEMM", default="true"):
             _ENABLE_JIT_DEEPGEMM = True
 
+
+def get_enable_jit_deepgemm():
+    return _ENABLE_JIT_DEEPGEMM
+
+
 logger = logging.getLogger(__name__)
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
@@ -293,7 +298,7 @@ def _maybe_compile_deep_gemm_one_type_all(
         logger.info(
             f"Try DeepGEMM JIT Compiling for "
             f"<{kernel_helper.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
-            f"{' It only takes a litte time(Typically 1 sec) if you have run `sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
+            f"{' It only takes a litte time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
         # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
